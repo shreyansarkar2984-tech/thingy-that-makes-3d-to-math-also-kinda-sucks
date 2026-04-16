@@ -1,311 +1,568 @@
-#include "model_loader.h"
+#include "renderer.h"
 
 #include <algorithm>
-#include <fstream>
-#include <iomanip>
-#include <sstream>
-#include <string>
-#include <unordered_set>
+#include <cmath>
+#include <cstring>
+#include <vector>
+
+#include <GL/gl.h>
+#include <GL/glext.h>
+#include <GL/wglext.h>
 
 namespace {
 
-std::string FormatDouble(double value, int precision = 4) {
-    std::ostringstream stream;
-    stream << std::fixed << std::setprecision(precision) << value;
-    std::string text = stream.str();
-    while (!text.empty() && text.back() == '0') {
-        text.pop_back();
-    }
-    if (!text.empty() && text.back() == '.') {
-        text.pop_back();
-    }
-    if (text.empty() || text == "-0") {
-        return "0";
-    }
-    return text;
+constexpr wchar_t kViewportClassName[] = L"ModelEquationViewport";
+constexpr UINT kViewportSetModelMessage = WM_APP + 41;
+constexpr UINT kViewportClearMessage = WM_APP + 42;
+
+PFNWGLCREATECONTEXTATTRIBSARBPROC gCreateContextAttribs = nullptr;
+PFNGLGENVERTEXARRAYSPROC glGenVertexArraysFn = nullptr;
+PFNGLBINDVERTEXARRAYPROC glBindVertexArrayFn = nullptr;
+PFNGLDELETEVERTEXARRAYSPROC glDeleteVertexArraysFn = nullptr;
+PFNGLGENBUFFERSPROC glGenBuffersFn = nullptr;
+PFNGLBINDBUFFERPROC glBindBufferFn = nullptr;
+PFNGLBUFFERDATAPROC glBufferDataFn = nullptr;
+PFNGLDELETEBUFFERSPROC glDeleteBuffersFn = nullptr;
+PFNGLCREATESHADERPROC glCreateShaderFn = nullptr;
+PFNGLSHADERSOURCEPROC glShaderSourceFn = nullptr;
+PFNGLCOMPILESHADERPROC glCompileShaderFn = nullptr;
+PFNGLGETSHADERIVPROC glGetShaderivFn = nullptr;
+PFNGLGETSHADERINFOLOGPROC glGetShaderInfoLogFn = nullptr;
+PFNGLCREATEPROGRAMPROC glCreateProgramFn = nullptr;
+PFNGLATTACHSHADERPROC glAttachShaderFn = nullptr;
+PFNGLLINKPROGRAMPROC glLinkProgramFn = nullptr;
+PFNGLGETPROGRAMIVPROC glGetProgramivFn = nullptr;
+PFNGLGETPROGRAMINFOLOGPROC glGetProgramInfoLogFn = nullptr;
+PFNGLUSEPROGRAMPROC glUseProgramFn = nullptr;
+PFNGLDELETEPROGRAMPROC glDeleteProgramFn = nullptr;
+PFNGLDELETESHADERPROC glDeleteShaderFn = nullptr;
+PFNGLVERTEXATTRIBPOINTERPROC glVertexAttribPointerFn = nullptr;
+PFNGLENABLEVERTEXATTRIBARRAYPROC glEnableVertexAttribArrayFn = nullptr;
+PFNGLGETUNIFORMLOCATIONPROC glGetUniformLocationFn = nullptr;
+PFNGLUNIFORMMATRIX4FVPROC glUniformMatrix4fvFn = nullptr;
+PFNGLUNIFORM3FPROC glUniform3fFn = nullptr;
+
+struct Mat4 {
+    float values[16] = {};
+};
+
+struct RendererState {
+    HDC deviceContext = nullptr;
+    HGLRC renderContext = nullptr;
+    GLuint program = 0;
+    GLuint vao = 0;
+    GLuint vertexBuffer = 0;
+    GLuint indexBuffer = 0;
+    GLint mvpLocation = -1;
+    GLint colorLocation = -1;
+    std::vector<float> renderPositions;
+    std::vector<std::uint32_t> renderIndices;
+    int width = 1;
+    int height = 1;
+    float orbitYaw = 0.78f;
+    float orbitPitch = -0.48f;
+    float zoomDistance = 3.0f;
+    bool dragging = false;
+    POINT lastMouse{};
+};
+
+Mat4 IdentityMatrix() {
+    Mat4 matrix{};
+    matrix.values[0] = 1.0f;
+    matrix.values[5] = 1.0f;
+    matrix.values[10] = 1.0f;
+    matrix.values[15] = 1.0f;
+    return matrix;
 }
 
-void BuildLineIndices(ModelData& model);
-
-void PushVertex(ModelData& model, float x, float y, float z) {
-    model.positions.push_back(x);
-    model.positions.push_back(y);
-    model.positions.push_back(z);
-}
-
-void ComputeDerivedData(ModelData& model) {
-    if (model.positions.empty()) {
-        model.scale = 1.0f;
-        return;
-    }
-
-    model.boundsMin[0] = model.boundsMax[0] = model.positions[0];
-    model.boundsMin[1] = model.boundsMax[1] = model.positions[1];
-    model.boundsMin[2] = model.boundsMax[2] = model.positions[2];
-
-    for (std::size_t index = 0; index < model.positions.size(); index += 3) {
-        for (int axis = 0; axis < 3; ++axis) {
-            model.boundsMin[axis] = std::min(model.boundsMin[axis], model.positions[index + axis]);
-            model.boundsMax[axis] = std::max(model.boundsMax[axis], model.positions[index + axis]);
-        }
-    }
-
-    for (int axis = 0; axis < 3; ++axis) {
-        model.center[axis] = (model.boundsMin[axis] + model.boundsMax[axis]) * 0.5f;
-    }
-
-    const float extentX = model.boundsMax[0] - model.boundsMin[0];
-    const float extentY = model.boundsMax[1] - model.boundsMin[1];
-    const float extentZ = model.boundsMax[2] - model.boundsMin[2];
-    model.scale = std::max({extentX, extentY, extentZ}) * 0.5f;
-    if (model.scale < 1e-6f) {
-        model.scale = 1.0f;
-    }
-}
-
-void FinalizeModel(ModelData& model) {
-    BuildLineIndices(model);
-    ComputeDerivedData(model);
-}
-
-void BuildLineIndices(ModelData& model) {
-    model.lineIndices.clear();
-    if (!model.triangles.empty()) {
-        std::unordered_set<std::uint64_t> edges;
-        edges.reserve(model.triangles.size());
-
-        auto addEdge = [&](std::uint32_t a, std::uint32_t b) {
-            const std::uint32_t low = std::min(a, b);
-            const std::uint32_t high = std::max(a, b);
-            const std::uint64_t key = (static_cast<std::uint64_t>(low) << 32) | static_cast<std::uint64_t>(high);
-            if (edges.insert(key).second) {
-                model.lineIndices.push_back(a);
-                model.lineIndices.push_back(b);
+Mat4 Multiply(const Mat4& left, const Mat4& right) {
+    Mat4 result{};
+    for (int column = 0; column < 4; ++column) {
+        for (int row = 0; row < 4; ++row) {
+            for (int k = 0; k < 4; ++k) {
+                result.values[column * 4 + row] += left.values[k * 4 + row] * right.values[column * 4 + k];
             }
-        };
-
-        for (std::size_t index = 0; index + 2 < model.triangles.size(); index += 3) {
-            const std::uint32_t a = model.triangles[index];
-            const std::uint32_t b = model.triangles[index + 1];
-            const std::uint32_t c = model.triangles[index + 2];
-            addEdge(a, b);
-            addEdge(b, c);
-            addEdge(c, a);
         }
+    }
+    return result;
+}
+
+Mat4 RotationX(float angle) {
+    Mat4 matrix = IdentityMatrix();
+    const float c = std::cos(angle);
+    const float s = std::sin(angle);
+    matrix.values[5] = c;
+    matrix.values[6] = s;
+    matrix.values[9] = -s;
+    matrix.values[10] = c;
+    return matrix;
+}
+
+Mat4 RotationY(float angle) {
+    Mat4 matrix = IdentityMatrix();
+    const float c = std::cos(angle);
+    const float s = std::sin(angle);
+    matrix.values[0] = c;
+    matrix.values[2] = -s;
+    matrix.values[8] = s;
+    matrix.values[10] = c;
+    return matrix;
+}
+
+Mat4 Translation(float x, float y, float z) {
+    Mat4 matrix = IdentityMatrix();
+    matrix.values[12] = x;
+    matrix.values[13] = y;
+    matrix.values[14] = z;
+    return matrix;
+}
+
+Mat4 Perspective(float fovY, float aspect, float nearPlane, float farPlane) {
+    Mat4 matrix{};
+    const float f = 1.0f / std::tan(fovY * 0.5f);
+    matrix.values[0] = f / aspect;
+    matrix.values[5] = f;
+    matrix.values[10] = (farPlane + nearPlane) / (nearPlane - farPlane);
+    matrix.values[11] = -1.0f;
+    matrix.values[14] = (2.0f * farPlane * nearPlane) / (nearPlane - farPlane);
+    return matrix;
+}
+
+PROC LoadGlSymbol(const char* name) {
+    PROC address = wglGetProcAddress(name);
+    if (address == nullptr || address == reinterpret_cast<PROC>(0x1) || address == reinterpret_cast<PROC>(0x2) || address == reinterpret_cast<PROC>(0x3) || address == reinterpret_cast<PROC>(-1)) {
+        static HMODULE module = GetModuleHandleW(L"opengl32.dll");
+        address = GetProcAddress(module, name);
+    }
+    return address;
+}
+
+bool LoadModernFunctions() {
+    glGenVertexArraysFn = reinterpret_cast<PFNGLGENVERTEXARRAYSPROC>(LoadGlSymbol("glGenVertexArrays"));
+    glBindVertexArrayFn = reinterpret_cast<PFNGLBINDVERTEXARRAYPROC>(LoadGlSymbol("glBindVertexArray"));
+    glDeleteVertexArraysFn = reinterpret_cast<PFNGLDELETEVERTEXARRAYSPROC>(LoadGlSymbol("glDeleteVertexArrays"));
+    glGenBuffersFn = reinterpret_cast<PFNGLGENBUFFERSPROC>(LoadGlSymbol("glGenBuffers"));
+    glBindBufferFn = reinterpret_cast<PFNGLBINDBUFFERPROC>(LoadGlSymbol("glBindBuffer"));
+    glBufferDataFn = reinterpret_cast<PFNGLBUFFERDATAPROC>(LoadGlSymbol("glBufferData"));
+    glDeleteBuffersFn = reinterpret_cast<PFNGLDELETEBUFFERSPROC>(LoadGlSymbol("glDeleteBuffers"));
+    glCreateShaderFn = reinterpret_cast<PFNGLCREATESHADERPROC>(LoadGlSymbol("glCreateShader"));
+    glShaderSourceFn = reinterpret_cast<PFNGLSHADERSOURCEPROC>(LoadGlSymbol("glShaderSource"));
+    glCompileShaderFn = reinterpret_cast<PFNGLCOMPILESHADERPROC>(LoadGlSymbol("glCompileShader"));
+    glGetShaderivFn = reinterpret_cast<PFNGLGETSHADERIVPROC>(LoadGlSymbol("glGetShaderiv"));
+    glGetShaderInfoLogFn = reinterpret_cast<PFNGLGETSHADERINFOLOGPROC>(LoadGlSymbol("glGetShaderInfoLog"));
+    glCreateProgramFn = reinterpret_cast<PFNGLCREATEPROGRAMPROC>(LoadGlSymbol("glCreateProgram"));
+    glAttachShaderFn = reinterpret_cast<PFNGLATTACHSHADERPROC>(LoadGlSymbol("glAttachShader"));
+    glLinkProgramFn = reinterpret_cast<PFNGLLINKPROGRAMPROC>(LoadGlSymbol("glLinkProgram"));
+    glGetProgramivFn = reinterpret_cast<PFNGLGETPROGRAMIVPROC>(LoadGlSymbol("glGetProgramiv"));
+    glGetProgramInfoLogFn = reinterpret_cast<PFNGLGETPROGRAMINFOLOGPROC>(LoadGlSymbol("glGetProgramInfoLog"));
+    glUseProgramFn = reinterpret_cast<PFNGLUSEPROGRAMPROC>(LoadGlSymbol("glUseProgram"));
+    glDeleteProgramFn = reinterpret_cast<PFNGLDELETEPROGRAMPROC>(LoadGlSymbol("glDeleteProgram"));
+    glDeleteShaderFn = reinterpret_cast<PFNGLDELETESHADERPROC>(LoadGlSymbol("glDeleteShader"));
+    glVertexAttribPointerFn = reinterpret_cast<PFNGLVERTEXATTRIBPOINTERPROC>(LoadGlSymbol("glVertexAttribPointer"));
+    glEnableVertexAttribArrayFn = reinterpret_cast<PFNGLENABLEVERTEXATTRIBARRAYPROC>(LoadGlSymbol("glEnableVertexAttribArray"));
+    glGetUniformLocationFn = reinterpret_cast<PFNGLGETUNIFORMLOCATIONPROC>(LoadGlSymbol("glGetUniformLocation"));
+    glUniformMatrix4fvFn = reinterpret_cast<PFNGLUNIFORMMATRIX4FVPROC>(LoadGlSymbol("glUniformMatrix4fv"));
+    glUniform3fFn = reinterpret_cast<PFNGLUNIFORM3FPROC>(LoadGlSymbol("glUniform3f"));
+
+    return glGenVertexArraysFn && glBindVertexArrayFn && glDeleteVertexArraysFn
+        && glGenBuffersFn && glBindBufferFn && glBufferDataFn && glDeleteBuffersFn
+        && glCreateShaderFn && glShaderSourceFn && glCompileShaderFn && glGetShaderivFn
+        && glCreateProgramFn && glAttachShaderFn && glLinkProgramFn && glGetProgramivFn
+        && glUseProgramFn && glDeleteProgramFn && glDeleteShaderFn
+        && glVertexAttribPointerFn && glEnableVertexAttribArrayFn
+        && glGetUniformLocationFn && glUniformMatrix4fvFn && glUniform3fFn;
+}
+
+GLuint CompileShader(GLenum type, const char* source) {
+    const GLuint shader = glCreateShaderFn(type);
+    glShaderSourceFn(shader, 1, &source, nullptr);
+    glCompileShaderFn(shader);
+
+    GLint success = GL_FALSE;
+    glGetShaderivFn(shader, GL_COMPILE_STATUS, &success);
+    if (success == GL_FALSE) {
+        glDeleteShaderFn(shader);
+        return 0;
+    }
+    return shader;
+}
+
+GLuint CreateProgram() {
+    constexpr const char* vertexShaderSource =
+        "#version 330 core\n"
+        "layout(location = 0) in vec3 aPos;\n"
+        "uniform mat4 uMVP;\n"
+        "void main() {\n"
+        "  gl_Position = uMVP * vec4(aPos, 1.0);\n"
+        "  gl_PointSize = 5.0;\n"
+        "}\n";
+
+    constexpr const char* fragmentShaderSource =
+        "#version 330 core\n"
+        "uniform vec3 uColor;\n"
+        "out vec4 FragColor;\n"
+        "void main() {\n"
+        "  FragColor = vec4(uColor, 1.0);\n"
+        "}\n";
+
+    const GLuint vertexShader = CompileShader(GL_VERTEX_SHADER, vertexShaderSource);
+    const GLuint fragmentShader = CompileShader(GL_FRAGMENT_SHADER, fragmentShaderSource);
+    if (vertexShader == 0 || fragmentShader == 0) {
+        if (vertexShader != 0) {
+            glDeleteShaderFn(vertexShader);
+        }
+        if (fragmentShader != 0) {
+            glDeleteShaderFn(fragmentShader);
+        }
+        return 0;
+    }
+
+    const GLuint program = glCreateProgramFn();
+    glAttachShaderFn(program, vertexShader);
+    glAttachShaderFn(program, fragmentShader);
+    glLinkProgramFn(program);
+
+    GLint success = GL_FALSE;
+    glGetProgramivFn(program, GL_LINK_STATUS, &success);
+    glDeleteShaderFn(vertexShader);
+    glDeleteShaderFn(fragmentShader);
+    if (success == GL_FALSE) {
+        glDeleteProgramFn(program);
+        return 0;
+    }
+
+    return program;
+}
+
+bool EnsureWglCreateContextLoaded() {
+    if (gCreateContextAttribs != nullptr) {
+        return true;
+    }
+
+    WNDCLASSW dummyClass{};
+    dummyClass.lpfnWndProc = DefWindowProcW;
+    dummyClass.hInstance = GetModuleHandleW(nullptr);
+    dummyClass.lpszClassName = L"DummyOpenGLLoaderWindow";
+    dummyClass.style = CS_OWNDC;
+    RegisterClassW(&dummyClass);
+
+    HWND dummyWindow = CreateWindowW(dummyClass.lpszClassName, L"", WS_OVERLAPPED, 0, 0, 1, 1, nullptr, nullptr, dummyClass.hInstance, nullptr);
+    if (dummyWindow == nullptr) {
+        return false;
+    }
+
+    HDC dummyDc = GetDC(dummyWindow);
+    PIXELFORMATDESCRIPTOR pfd{};
+    pfd.nSize = sizeof(pfd);
+    pfd.nVersion = 1;
+    pfd.dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
+    pfd.iPixelType = PFD_TYPE_RGBA;
+    pfd.cColorBits = 32;
+    pfd.cDepthBits = 24;
+    pfd.iLayerType = PFD_MAIN_PLANE;
+
+    const int pixelFormat = ChoosePixelFormat(dummyDc, &pfd);
+    SetPixelFormat(dummyDc, pixelFormat, &pfd);
+
+    HGLRC dummyContext = wglCreateContext(dummyDc);
+    wglMakeCurrent(dummyDc, dummyContext);
+    gCreateContextAttribs = reinterpret_cast<PFNWGLCREATECONTEXTATTRIBSARBPROC>(wglGetProcAddress("wglCreateContextAttribsARB"));
+    wglMakeCurrent(nullptr, nullptr);
+    wglDeleteContext(dummyContext);
+    ReleaseDC(dummyWindow, dummyDc);
+    DestroyWindow(dummyWindow);
+    return gCreateContextAttribs != nullptr;
+}
+
+RendererState* GetState(HWND window) {
+    return reinterpret_cast<RendererState*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+}
+
+int MouseXFromLParam(LPARAM value) {
+    return static_cast<int>(static_cast<short>(LOWORD(value)));
+}
+
+int MouseYFromLParam(LPARAM value) {
+    return static_cast<int>(static_cast<short>(HIWORD(value)));
+}
+
+void UploadModel(RendererState& state, const ModelData& model) {
+    state.renderPositions.clear();
+    state.renderIndices = model.lineIndices;
+    state.renderPositions.reserve(model.positions.size());
+
+    for (std::size_t index = 0; index < model.VertexCount(); ++index) {
+        const float x = (model.positions[index * 3] - model.center[0]) / model.scale;
+        const float y = (model.positions[index * 3 + 1] - model.center[1]) / model.scale;
+        const float z = (model.positions[index * 3 + 2] - model.center[2]) / model.scale;
+        state.renderPositions.push_back(x);
+        state.renderPositions.push_back(y);
+        state.renderPositions.push_back(z);
+    }
+
+    wglMakeCurrent(state.deviceContext, state.renderContext);
+    glBindVertexArrayFn(state.vao);
+    glBindBufferFn(GL_ARRAY_BUFFER, state.vertexBuffer);
+    glBufferDataFn(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(state.renderPositions.size() * sizeof(float)), state.renderPositions.data(), GL_STATIC_DRAW);
+
+    glBindBufferFn(GL_ELEMENT_ARRAY_BUFFER, state.indexBuffer);
+    const void* indexData = state.renderIndices.empty() ? nullptr : state.renderIndices.data();
+    glBufferDataFn(GL_ELEMENT_ARRAY_BUFFER, static_cast<GLsizeiptr>(state.renderIndices.size() * sizeof(std::uint32_t)), indexData, GL_STATIC_DRAW);
+    wglMakeCurrent(nullptr, nullptr);
+}
+
+bool InitializeRenderer(HWND window, RendererState& state) {
+    state.deviceContext = GetDC(window);
+    PIXELFORMATDESCRIPTOR pfd{};
+    pfd.nSize = sizeof(pfd);
+    pfd.nVersion = 1;
+    pfd.dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
+    pfd.iPixelType = PFD_TYPE_RGBA;
+    pfd.cColorBits = 32;
+    pfd.cDepthBits = 24;
+    pfd.iLayerType = PFD_MAIN_PLANE;
+
+    const int pixelFormat = ChoosePixelFormat(state.deviceContext, &pfd);
+    if (pixelFormat == 0 || !SetPixelFormat(state.deviceContext, pixelFormat, &pfd)) {
+        return false;
+    }
+
+    EnsureWglCreateContextLoaded();
+    if (gCreateContextAttribs != nullptr) {
+        const int attributes[] = {
+            WGL_CONTEXT_MAJOR_VERSION_ARB, 3,
+            WGL_CONTEXT_MINOR_VERSION_ARB, 3,
+            WGL_CONTEXT_PROFILE_MASK_ARB, WGL_CONTEXT_CORE_PROFILE_BIT_ARB,
+            0,
+        };
+        state.renderContext = gCreateContextAttribs(state.deviceContext, nullptr, attributes);
+    }
+
+    if (state.renderContext == nullptr) {
+        state.renderContext = wglCreateContext(state.deviceContext);
+    }
+    if (state.renderContext == nullptr || !wglMakeCurrent(state.deviceContext, state.renderContext)) {
+        return false;
+    }
+
+    if (!LoadModernFunctions()) {
+        return false;
+    }
+
+    state.program = CreateProgram();
+    if (state.program == 0) {
+        return false;
+    }
+
+    glGenVertexArraysFn(1, &state.vao);
+    glBindVertexArrayFn(state.vao);
+    glGenBuffersFn(1, &state.vertexBuffer);
+    glGenBuffersFn(1, &state.indexBuffer);
+
+    glBindBufferFn(GL_ARRAY_BUFFER, state.vertexBuffer);
+    glVertexAttribPointerFn(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), nullptr);
+    glEnableVertexAttribArrayFn(0);
+
+    glBindBufferFn(GL_ELEMENT_ARRAY_BUFFER, state.indexBuffer);
+    state.mvpLocation = glGetUniformLocationFn(state.program, "uMVP");
+    state.colorLocation = glGetUniformLocationFn(state.program, "uColor");
+    glEnable(GL_DEPTH_TEST);
+    wglMakeCurrent(nullptr, nullptr);
+    return true;
+}
+
+void DestroyRenderer(RendererState& state) {
+    if (state.deviceContext == nullptr || state.renderContext == nullptr) {
         return;
     }
 
-    if (model.VertexCount() >= 2) {
-        for (std::uint32_t index = 0; index + 1 < model.VertexCount(); ++index) {
-            model.lineIndices.push_back(index);
-            model.lineIndices.push_back(index + 1);
-        }
+    wglMakeCurrent(state.deviceContext, state.renderContext);
+    if (state.program != 0) {
+        glDeleteProgramFn(state.program);
     }
+    if (state.vertexBuffer != 0) {
+        glDeleteBuffersFn(1, &state.vertexBuffer);
+    }
+    if (state.indexBuffer != 0) {
+        glDeleteBuffersFn(1, &state.indexBuffer);
+    }
+    if (state.vao != 0) {
+        glDeleteVertexArraysFn(1, &state.vao);
+    }
+    wglMakeCurrent(nullptr, nullptr);
+    wglDeleteContext(state.renderContext);
+    state.renderContext = nullptr;
 }
 
-bool ParseFaceIndex(const std::string& token, std::size_t vertexCount, std::uint32_t& outIndex) {
-    if (token.empty()) {
-        return false;
+void Render(RendererState& state) {
+    if (state.renderContext == nullptr) {
+        return;
     }
 
-    const std::size_t slash = token.find('/');
-    const std::string indexText = token.substr(0, slash);
-    if (indexText.empty()) {
-        return false;
+    wglMakeCurrent(state.deviceContext, state.renderContext);
+    glViewport(0, 0, std::max(1, state.width), std::max(1, state.height));
+    glClearColor(0.94f, 0.96f, 0.99f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    glUseProgramFn(state.program);
+    const float aspect = static_cast<float>(std::max(1, state.width)) / static_cast<float>(std::max(1, state.height));
+    const Mat4 projection = Perspective(1.0f, aspect, 0.1f, 20.0f);
+    const Mat4 view = Translation(0.0f, 0.0f, -state.zoomDistance);
+    const Mat4 model = Multiply(RotationY(state.orbitYaw), RotationX(state.orbitPitch));
+    const Mat4 mvp = Multiply(projection, Multiply(view, model));
+
+    glUniformMatrix4fvFn(state.mvpLocation, 1, GL_FALSE, mvp.values);
+    glUniform3fFn(state.colorLocation, 0.16f, 0.38f, 0.69f);
+
+    glBindVertexArrayFn(state.vao);
+    if (!state.renderIndices.empty()) {
+        glDrawElements(GL_LINES, static_cast<GLsizei>(state.renderIndices.size()), GL_UNSIGNED_INT, nullptr);
+    } else if (!state.renderPositions.empty()) {
+        glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(state.renderPositions.size() / 3));
     }
 
-    int rawIndex = 0;
-    try {
-        rawIndex = std::stoi(indexText);
-    } catch (...) {
-        return false;
-    }
+    SwapBuffers(state.deviceContext);
+    wglMakeCurrent(nullptr, nullptr);
+}
 
-    if (rawIndex > 0) {
-        outIndex = static_cast<std::uint32_t>(rawIndex - 1);
-        return outIndex < vertexCount;
-    }
+LRESULT CALLBACK ViewportProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    switch (message) {
+        case WM_CREATE: {
+            auto* state = new RendererState();
+            SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+            InitializeRenderer(window, *state);
+            return 0;
+        }
 
-    if (rawIndex < 0) {
-        const int converted = static_cast<int>(vertexCount) + rawIndex;
-        if (converted >= 0) {
-            outIndex = static_cast<std::uint32_t>(converted);
-            return true;
+        case WM_SIZE: {
+            if (RendererState* state = GetState(window)) {
+                state->width = LOWORD(lParam);
+                state->height = HIWORD(lParam);
+                InvalidateRect(window, nullptr, FALSE);
+            }
+            return 0;
+        }
+
+        case WM_ERASEBKGND:
+            return 1;
+
+        case WM_LBUTTONDOWN: {
+            if (RendererState* state = GetState(window)) {
+                state->dragging = true;
+                state->lastMouse.x = MouseXFromLParam(lParam);
+                state->lastMouse.y = MouseYFromLParam(lParam);
+                SetFocus(window);
+                SetCapture(window);
+            }
+            return 0;
+        }
+
+        case WM_MOUSEMOVE: {
+            if (RendererState* state = GetState(window); state != nullptr && state->dragging) {
+                const int currentX = MouseXFromLParam(lParam);
+                const int currentY = MouseYFromLParam(lParam);
+                const int deltaX = currentX - state->lastMouse.x;
+                const int deltaY = currentY - state->lastMouse.y;
+                state->lastMouse.x = currentX;
+                state->lastMouse.y = currentY;
+
+                state->orbitYaw += static_cast<float>(deltaX) * 0.012f;
+                state->orbitPitch += static_cast<float>(deltaY) * 0.012f;
+                state->orbitPitch = std::clamp(state->orbitPitch, -1.45f, 1.45f);
+                InvalidateRect(window, nullptr, FALSE);
+            }
+            return 0;
+        }
+
+        case WM_LBUTTONUP: {
+            if (RendererState* state = GetState(window)) {
+                state->dragging = false;
+            }
+            ReleaseCapture();
+            return 0;
+        }
+
+        case WM_CAPTURECHANGED: {
+            if (RendererState* state = GetState(window)) {
+                state->dragging = false;
+            }
+            return 0;
+        }
+
+        case WM_MOUSEWHEEL: {
+            if (RendererState* state = GetState(window)) {
+                const float wheelDelta = static_cast<float>(GET_WHEEL_DELTA_WPARAM(wParam)) / static_cast<float>(WHEEL_DELTA);
+                state->zoomDistance -= wheelDelta * 0.22f;
+                state->zoomDistance = std::clamp(state->zoomDistance, 1.1f, 8.0f);
+                InvalidateRect(window, nullptr, FALSE);
+            }
+            return 0;
+        }
+
+        case WM_PAINT: {
+            PAINTSTRUCT paint{};
+            BeginPaint(window, &paint);
+            if (RendererState* state = GetState(window)) {
+                Render(*state);
+            }
+            EndPaint(window, &paint);
+            return 0;
+        }
+
+        case kViewportSetModelMessage: {
+            if (RendererState* state = GetState(window)) {
+                const auto* model = reinterpret_cast<const ModelData*>(lParam);
+                if (model != nullptr) {
+                    UploadModel(*state, *model);
+                    InvalidateRect(window, nullptr, FALSE);
+                }
+            }
+            return 0;
+        }
+
+        case kViewportClearMessage: {
+            if (RendererState* state = GetState(window)) {
+                state->renderPositions.clear();
+                state->renderIndices.clear();
+                UploadModel(*state, ModelData{});
+                InvalidateRect(window, nullptr, FALSE);
+            }
+            return 0;
+        }
+
+        case WM_DESTROY: {
+            if (RendererState* state = GetState(window)) {
+                DestroyRenderer(*state);
+                delete state;
+                SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+            }
+            return 0;
         }
     }
 
-    return false;
+    return DefWindowProcW(window, message, wParam, lParam);
 }
 
 }  // namespace
 
-bool LoadObjModel(const std::filesystem::path& path, ModelData& outModel, std::wstring& errorMessage) {
-    std::ifstream input(path);
-    if (!input) {
-        errorMessage = L"Could not open the OBJ file.";
-        return false;
-    }
-
-    ModelData model;
-    model.label = path.filename().wstring();
-
-    std::string line;
-    while (std::getline(input, line)) {
-        std::istringstream row(line);
-        std::string tag;
-        row >> tag;
-        if (tag == "v") {
-            float x = 0.0f;
-            float y = 0.0f;
-            float z = 0.0f;
-            if (row >> x >> y >> z) {
-                PushVertex(model, x, y, z);
-            }
-        } else if (tag == "f") {
-            std::vector<std::uint32_t> polygon;
-            std::string token;
-            while (row >> token) {
-                std::uint32_t vertexIndex = 0;
-                if (ParseFaceIndex(token, model.VertexCount(), vertexIndex)) {
-                    polygon.push_back(vertexIndex);
-                }
-            }
-
-            if (polygon.size() >= 3) {
-                for (std::size_t index = 1; index + 1 < polygon.size(); ++index) {
-                    model.triangles.push_back(polygon[0]);
-                    model.triangles.push_back(polygon[index]);
-                    model.triangles.push_back(polygon[index + 1]);
-                }
-            }
-        }
-    }
-
-    if (model.positions.empty()) {
-        errorMessage = L"No vertex positions were found in the OBJ file.";
-        return false;
-    }
-
-    FinalizeModel(model);
-    outModel = std::move(model);
-    return true;
+bool RegisterViewportClass(HINSTANCE instance) {
+    WNDCLASSW windowClass{};
+    windowClass.lpfnWndProc = ViewportProc;
+    windowClass.hInstance = instance;
+    windowClass.lpszClassName = kViewportClassName;
+    windowClass.style = CS_OWNDC;
+    windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    return RegisterClassW(&windowClass) != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
 }
 
-bool DownsampleModel(const ModelData& input, std::size_t maxVertices, ModelData& output, std::wstring& summary) {
-    if (input.VertexCount() == 0) {
-        summary = L"No vertices were available for downsampling.";
-        return false;
-    }
-
-    if (maxVertices < 3) {
-        summary = L"Downsampling requires a vertex budget of at least 3.";
-        return false;
-    }
-
-    if (input.VertexCount() <= maxVertices) {
-        output = input;
-        summary = L"Model stayed at full resolution because it was already inside the vertex budget.";
-        return true;
-    }
-
-    const std::size_t targetCount = maxVertices;
-    std::vector<std::uint32_t> remap(input.VertexCount(), UINT32_MAX);
-    ModelData reduced;
-    reduced.label = input.label;
-    reduced.positions.reserve(targetCount * 3);
-
-    for (std::size_t newIndex = 0; newIndex < targetCount; ++newIndex) {
-        const std::size_t oldIndex = (newIndex * (input.VertexCount() - 1)) / (targetCount - 1);
-        if (remap[oldIndex] != UINT32_MAX) {
-            continue;
-        }
-
-        remap[oldIndex] = static_cast<std::uint32_t>(reduced.VertexCount());
-        reduced.positions.push_back(input.positions[oldIndex * 3]);
-        reduced.positions.push_back(input.positions[oldIndex * 3 + 1]);
-        reduced.positions.push_back(input.positions[oldIndex * 3 + 2]);
-    }
-
-    if (reduced.VertexCount() < 3) {
-        summary = L"Downsampling collapsed the mesh too far.";
-        return false;
-    }
-
-    reduced.triangles.reserve(input.triangles.size());
-    for (std::size_t index = 0; index + 2 < input.triangles.size(); index += 3) {
-        const std::uint32_t a = input.triangles[index];
-        const std::uint32_t b = input.triangles[index + 1];
-        const std::uint32_t c = input.triangles[index + 2];
-        if (a >= remap.size() || b >= remap.size() || c >= remap.size()) {
-            continue;
-        }
-
-        const std::uint32_t mappedA = remap[a];
-        const std::uint32_t mappedB = remap[b];
-        const std::uint32_t mappedC = remap[c];
-        if (mappedA == UINT32_MAX || mappedB == UINT32_MAX || mappedC == UINT32_MAX) {
-            continue;
-        }
-        if (mappedA == mappedB || mappedB == mappedC || mappedA == mappedC) {
-            continue;
-        }
-
-        reduced.triangles.push_back(mappedA);
-        reduced.triangles.push_back(mappedB);
-        reduced.triangles.push_back(mappedC);
-    }
-
-    FinalizeModel(reduced);
-    output = std::move(reduced);
-    summary = L"Model downscaled from "
-        + std::to_wstring(input.VertexCount())
-        + L" vertices to "
-        + std::to_wstring(output.VertexCount())
-        + L" vertices for the lighter build.";
-    return true;
+HWND CreateViewportWindow(HINSTANCE instance, HWND parent, int controlId) {
+    return CreateWindowW(kViewportClassName, L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN, 0, 0, 0, 0, parent, reinterpret_cast<HMENU>(controlId), instance, nullptr);
 }
 
-std::wstring DescribeModel(const ModelData& model) {
-    std::ostringstream stream;
-    stream << "Label: " << std::string(model.label.begin(), model.label.end()) << "\r\n"
-           << "Vertices: " << model.VertexCount() << "\r\n"
-           << "Triangles: " << model.TriangleCount() << "\r\n"
-           << "Model memory: " << FormatDouble(static_cast<double>(model.MemoryBytes()) / 1024.0) << " KB\r\n"
-           << "Bounds min: (" << FormatDouble(model.boundsMin[0]) << ", " << FormatDouble(model.boundsMin[1]) << ", " << FormatDouble(model.boundsMin[2]) << ")\r\n"
-           << "Bounds max: (" << FormatDouble(model.boundsMax[0]) << ", " << FormatDouble(model.boundsMax[1]) << ", " << FormatDouble(model.boundsMax[2]) << ")\r\n"
-           << "Center: (" << FormatDouble(model.center[0]) << ", " << FormatDouble(model.center[1]) << ", " << FormatDouble(model.center[2]) << ")\r\n"
-           << "Half extent scale: " << FormatDouble(model.scale);
-    const std::string text = stream.str();
-    return std::wstring(text.begin(), text.end());
+void ViewportSetModel(HWND viewport, const ModelData* model) {
+    SendMessageW(viewport, kViewportSetModelMessage, 0, reinterpret_cast<LPARAM>(model));
 }
 
-std::wstring ConversionMethodName(ConversionMethod method) {
-    switch (method) {
-        case ConversionMethod::AutoDetect:
-            return L"Auto Detect";
-        case ConversionMethod::Plane:
-            return L"Best-Fit Plane";
-        case ConversionMethod::Sphere:
-            return L"Best-Fit Sphere";
-        case ConversionMethod::Cylinder:
-            return L"Best-Fit Cylinder";
-        case ConversionMethod::ImplicitQuadratic:
-            return L"Implicit Polynomial (Degree 2)";
-        case ConversionMethod::ImplicitCubic:
-            return L"Implicit Polynomial (Degree 3)";
-        case ConversionMethod::RbfImplicit:
-            return L"RBF Implicit Surface";
-    }
-    return L"Unknown";
-}
-
-void GetVertexPosition(const ModelData& model, std::size_t index, double& x, double& y, double& z) {
-    const std::size_t offset = index * 3;
-    x = model.positions[offset];
-    y = model.positions[offset + 1];
-    z = model.positions[offset + 2];
-}
-
-void FinalizeGeneratedModel(ModelData& model) {
-    FinalizeModel(model);
+void ViewportClear(HWND viewport) {
+    SendMessageW(viewport, kViewportClearMessage, 0, 0);
 }
