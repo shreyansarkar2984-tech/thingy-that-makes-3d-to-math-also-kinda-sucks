@@ -20,13 +20,14 @@ clang++ ^
   code\simple_main.cpp ^
   code\model_loader.cpp ^
   code\analysis_engine.cpp ^
+  code\gpu_compute.cpp ^
   code\renderer.cpp ^
   -lgdi32 ^
   -lcomdlg32 ^
   -lcomctl32 ^
   -lopengl32 ^
   -mwindows ^
-  -o %BUILD_DIR%\ModelEquationStudio_full.exe
+  -o %BUILD_DIR%\normal.exe
 
 if errorlevel 1 (
     exit /b 1
@@ -44,17 +45,44 @@ clang++ ^
   code\simple_main.cpp ^
   code\model_loader.cpp ^
   code\analysis_engine.cpp ^
+  code\gpu_compute.cpp ^
   code\renderer.cpp ^
   -lgdi32 ^
   -lcomdlg32 ^
   -lcomctl32 ^
   -lopengl32 ^
   -mwindows ^
-  -o %BUILD_DIR%\ModelEquationStudio_downscaled.exe
+  -o %BUILD_DIR%\light.exe
 
 if errorlevel 1 (
     exit /b 1
 )
 
-echo Built %BUILD_DIR%\ModelEquationStudio_full.exe
-echo Built %BUILD_DIR%\ModelEquationStudio_downscaled.exe
+clang++ ^
+  -std=c++20 ^
+  -O2 ^
+  -Wall ^
+  -Wextra ^
+  -municode ^
+  -DUNICODE ^
+  -D_UNICODE ^
+  -DMODEL_GPU_COMPUTE_ENABLED=1 ^
+  code\simple_main.cpp ^
+  code\model_loader.cpp ^
+  code\analysis_engine.cpp ^
+  code\gpu_compute.cpp ^
+  code\renderer.cpp ^
+  -lgdi32 ^
+  -lcomdlg32 ^
+  -lcomctl32 ^
+  -lopengl32 ^
+  -mwindows ^
+  -o %BUILD_DIR%\heavy.exe
+
+if errorlevel 1 (
+    exit /b 1
+)
+
+echo Built %BUILD_DIR%\normal.exe
+echo Built %BUILD_DIR%\light.exe
+echo Built %BUILD_DIR%\heavy.exe
