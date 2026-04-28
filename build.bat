@@ -17,11 +17,11 @@ clang++ ^
   -municode ^
   -DUNICODE ^
   -D_UNICODE ^
-  code\simple_main.cpp ^
-  code\model_loader.cpp ^
-  code\analysis_engine.cpp ^
-  code\gpu_compute.cpp ^
-  code\renderer.cpp ^
+  code\main.cpp ^
+  code\model.cpp ^
+  code\analysis.cpp ^
+  code\gpu.cpp ^
+  code\view.cpp ^
   -lgdi32 ^
   -lcomdlg32 ^
   -lcomctl32 ^
@@ -42,11 +42,11 @@ clang++ ^
   -DUNICODE ^
   -D_UNICODE ^
   -DMODEL_DOWNSCALE_ENABLED=1 ^
-  code\simple_main.cpp ^
-  code\model_loader.cpp ^
-  code\analysis_engine.cpp ^
-  code\gpu_compute.cpp ^
-  code\renderer.cpp ^
+  code\main.cpp ^
+  code\model.cpp ^
+  code\analysis.cpp ^
+  code\gpu.cpp ^
+  code\view.cpp ^
   -lgdi32 ^
   -lcomdlg32 ^
   -lcomctl32 ^
@@ -67,11 +67,11 @@ clang++ ^
   -DUNICODE ^
   -D_UNICODE ^
   -DMODEL_GPU_COMPUTE_ENABLED=1 ^
-  code\simple_main.cpp ^
-  code\model_loader.cpp ^
-  code\analysis_engine.cpp ^
-  code\gpu_compute.cpp ^
-  code\renderer.cpp ^
+  code\main.cpp ^
+  code\model.cpp ^
+  code\analysis.cpp ^
+  code\gpu.cpp ^
+  code\view.cpp ^
   -lgdi32 ^
   -lcomdlg32 ^
   -lcomctl32 ^
